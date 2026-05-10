@@ -137,13 +137,13 @@ struct llama_kv_cache {
 
     bool checkpoint_alloc_shadows();
     bool checkpoint_supported() const;
-    bool checkpoint_save();
-    bool checkpoint_restore();
+    bool checkpoint_save(ggml_backend_sched_t sched);
+    bool checkpoint_restore(ggml_backend_sched_t sched);
     void checkpoint_delete();
 
     // Per-step checkpoint: allocate, restore step k's full state (SSM + conv) to cache
     bool per_step_alloc(int max_tokens);
-    bool per_step_restore(int step);
+    bool per_step_restore(ggml_backend_sched_t sched, int step);
 
     ~llama_kv_cache() {
         for (struct ggml_context * ctx : ctxs) {
@@ -199,6 +199,7 @@ struct llama_context {
     struct llama_cparams        cparams;
     struct llama_sampling       sampling;
     struct llama_kv_cache       kv_self;
+    struct llama_context      * mtp_target_ctx   = nullptr;
     struct llama_control_vector cvec;
 
     std::vector<float> scale_data;
