@@ -26,6 +26,79 @@
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#include <immintrin.h>
+__attribute__((target("avx2,fma")))
+static inline bool add_and_check_nans_avx2(int n, const float * x, float * y, int * counts) {
+    int i = 0;
+    auto has_nans = _mm256_setzero_ps();
+    auto one = _mm256_set1_epi32(1);
+    {
+        __m256 vx[4], vy[4];
+        __m256i cy[4];
+        for ( ; i + 32 < n; i += 32) {
+            for (int k = 0; k < 4; ++k) {
+                vx[k] = _mm256_loadu_ps(x + i + 8*k);
+                vy[k] = _mm256_loadu_ps(y + i + 8*k);
+                cy[k] = _mm256_loadu_si256((const __m256i *)(counts + i + 8*k));
+                vy[k] = _mm256_fmadd_ps(vx[k], vx[k], vy[k]);
+                cy[k] = _mm256_add_epi32(cy[k], one);
+                auto mask = _mm256_cmp_ps(vx[k], vx[k], _CMP_UNORD_Q);
+                has_nans = _mm256_or_ps(has_nans, mask);
+            }
+            for (int k = 0; k < 4; ++k) {
+                _mm256_storeu_ps(y + i + 8*k, vy[k]);
+                _mm256_storeu_si256((__m256i *)(counts + i + 8*k), cy[k]);
+            }
+        }
+    }
+    for ( ; i + 7 < n; i += 8) {
+        auto vx = _mm256_loadu_ps(x + i);
+        auto vy = _mm256_loadu_ps(y + i);
+        auto cy = _mm256_loadu_si256((const __m256i *)(counts + i));
+        vy = _mm256_fmadd_ps(vx, vx, vy);
+        cy = _mm256_add_epi32(cy, one);
+        _mm256_storeu_ps(y + i, vy);
+        _mm256_storeu_si256((__m256i *)(counts + i), cy);
+        auto mask = _mm256_cmp_ps(vx, vx, _CMP_UNORD_Q);
+        has_nans = _mm256_or_ps(has_nans, mask);
+    }
+    auto has_any = _mm256_movemask_ps(has_nans);
+    if (has_any) {
+        return true;
+    }
+    for (; i < n; ++i) {
+        if (std::isnan(x[i])) {
+            return true;
+        }
+        y[i] += x[i]*x[i];
+        ++counts[i];
+    }
+    return false;
+}
+#endif
+static inline bool add_and_check_nans_scalar(int n, const float * x, float * y, int * counts) {
+    for (int i = 0; i < n; ++i) {
+        if (std::isnan(x[i])) {
+            return true;
+        }
+        y[i] += x[i]*x[i];
+        ++counts[i];
+    }
+    return false;
+}
+static bool add_and_check_nans(int n, const float * x, float * y, int * counts) {
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+    static const bool has_avx2 = __builtin_cpu_supports("avx2");
+    static const bool has_fma  = __builtin_cpu_supports("fma");
+    if (has_avx2 && has_fma) {
+        return add_and_check_nans_avx2(n, x, y, counts);
+    }
+#endif
+    return add_and_check_nans_scalar(n, x, y, counts);
+}
+
+
 uint32_t llama_mtp_state_n_embd(const struct llama_context * ctx);
 void llama_set_mtp_target_context(struct llama_context * ctx, struct llama_context * target_ctx);
 
@@ -248,6 +321,29 @@ static std::string filter_tensor_name(const char * name) {
     return wname;
 }
 
+static bool is_named_imatrix_tensor(const std::string & wname, const gpt_params & params, bool collect_lsim) {
+    if (wname.rfind("blk.", 0) == 0) {
+        return true;
+    }
+    if (wname == "mtp_pre_proj.weight" || wname == "mtp_post_proj.weight") {
+        return true;
+    }
+    return (params.process_output || collect_lsim) && wname == params.output_tensor_name;
+}
+
+static std::string default_draft_imatrix_out_file(const std::string & target_out_file) {
+    if (target_out_file.empty()) {
+        return "imatrix-draft.dat";
+    }
+
+    const auto dot = target_out_file.rfind('.');
+    if (dot == std::string::npos || dot == 0) {
+        return target_out_file + "-draft";
+    }
+
+    return target_out_file.substr(0, dot) + "-draft" + target_out_file.substr(dot);
+}
+
 void IMatrixCollector::print_layer_importance(const char * msg, const std::vector<std::pair<double, int>>& sim) {
     if (sim.empty()) return;
     std::vector<std::pair<float, int>> layers;
@@ -303,8 +399,7 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         if (t->op != GGML_OP_MUL_MAT) return false;
         // why are small batches ignored (<16 tokens)?
         if (src1->ne[1] < 16 || src1->type != GGML_TYPE_F32) return false;
-        //printf("wname = %s\n", wname.c_str());
-        if (!(wname.substr(0, 4) == "blk." || ((m_params.process_output || m_collect_lsim) && wname == m_params.output_tensor_name))) return false;
+        if (!is_named_imatrix_tensor(wname, m_params, m_collect_lsim)) return false;
         return true;
     }
 
@@ -401,14 +496,18 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                     const int64_t i12 = row;
                     const float * x = (const float *)((const char *)data + i11*src1->nb[1] + i12*src1->nb[2]);
 
-                    for (int j = 0; j < (int)src1->ne[0]; ++j) {
-                        e.values[e_start + j] += x[j]*x[j];
-                        e.counts[e_start + j]++;
-                        if (!std::isfinite(e.values[e_start + j])) {
-                            fprintf(stderr, "%f detected in %s\n", e.values[e_start + j], wname.c_str());
-                            exit(1);
-                        }
+                    if (add_and_check_nans(src1->ne[0], x, e.values.data() + e_start, e.counts.data() + e_start)) {
+                        fprintf(stderr, "etected NaNs in %s\n", wname.c_str());
+                        exit(1);
                     }
+                    //for (int j = 0; j < (int)src1->ne[0]; ++j) {
+                    //    e.values[e_start + j] += x[j]*x[j];
+                    //    e.counts[e_start + j]++;
+                    //    if (!std::isfinite(e.values[e_start + j])) {
+                    //        fprintf(stderr, "%f detected in %s\n", e.values[e_start + j], wname.c_str());
+                    //        exit(1);
+                    //    }
+                    //}
                 }
             }
             if (e.ncall > m_last_call) {
@@ -482,14 +581,18 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
             auto counts = e.counts.data() + i02*src0->ne[0];
             for (int i11 = 0; i11 < (int)src1->ne[1]; ++i11) {
                 const float * x = (const float *)((const char *)data + i11*src1->nb[1] + i12*src1->nb[2]);
-                for (int j = 0; j < (int)src1->ne[0]; ++j) {
-                    values[j] += x[j]*x[j];
-                    counts[j]++;
-                    if (!std::isfinite(values[j])) {
-                        fprintf(stderr, "%f detected in %s\n", e.values[j], wname.c_str());
-                        exit(1);
-                    }
+                if (add_and_check_nans(src1->ne[0], x, values, counts)) {
+                    fprintf(stderr, "detected NaNs in %s\n", wname.c_str());
+                    exit(1);
                 }
+                //for (int j = 0; j < (int)src1->ne[0]; ++j) {
+                //    values[j] += x[j]*x[j];
+                //    counts[j]++;
+                //    if (!std::isfinite(values[j])) {
+                //        fprintf(stderr, "%f detected in %s\n", values[j], wname.c_str());
+                //        exit(1);
+                //    }
+                //}
             }
         }
         if (e.ncall > m_last_call) {
@@ -682,10 +785,15 @@ bool IMatrixCollector::load_imatrix(const char * fname) {
     return true;
 }
 
-static IMatrixCollector g_collector;
+static IMatrixCollector g_target_collector;
+static IMatrixCollector g_draft_collector;
+
+static IMatrixCollector * ik_get_imatrix_collector(void * user_data) {
+    return user_data != nullptr ? static_cast<IMatrixCollector *>(user_data) : &g_target_collector;
+}
 
 static bool ik_collect_imatrix(struct ggml_tensor * t, bool ask, void * user_data) {
-    return g_collector.collect_imatrix(t, ask, user_data);
+    return ik_get_imatrix_collector(user_data)->collect_imatrix(t, ask, user_data);
 }
 
 
@@ -772,6 +880,8 @@ static gpt_params build_draft_imatrix_params(const gpt_params & params) {
     draft_params.n_gpu_layers = params.speculative.n_gpu_layers >= 0 ? params.speculative.n_gpu_layers : params.n_gpu_layers;
     draft_params.has_mtp = true;
     draft_params.warmup = false;
+    draft_params.out_file = params.out_file_draft.empty() ? default_draft_imatrix_out_file(params.out_file) : params.out_file_draft;
+    draft_params.out_file_draft.clear();
     draft_params.cb_eval = ik_collect_imatrix;
     draft_params.cb_eval_user_data = nullptr;
 
@@ -1008,12 +1118,12 @@ int main(int argc, char ** argv) {
 
     params.n_batch = std::min(params.n_batch, params.n_ctx);
 
-    g_collector.set_params(params);
-    g_collector.set_collect_lsim(lsim);
+    g_target_collector.set_params(params);
+    g_target_collector.set_collect_lsim(lsim);
 
     for (const auto & in_file : params.in_files) {
         printf("%s : loading imatrix from '%s'\n", __func__, in_file.c_str());
-        if (!g_collector.load_imatrix(in_file.c_str())) {
+        if (!g_target_collector.load_imatrix(in_file.c_str())) {
             fprintf(stderr, "%s : failed to load %s\n", __func__, in_file.c_str());
             return 1;
         }
@@ -1021,7 +1131,7 @@ int main(int argc, char ** argv) {
 
     if (params.in_files.size() > 1) {
         printf("%s : saving combined imatrix to '%s'\n", __func__, params.out_file.c_str());
-        g_collector.save_imatrix();
+        g_target_collector.save_imatrix();
     }
 
     llama_backend_init();
@@ -1035,7 +1145,7 @@ int main(int argc, char ** argv) {
         // pass the callback to the backend scheduler
         // it will be executed for each node during the graph computation
         target_params.cb_eval = ik_collect_imatrix;
-        target_params.cb_eval_user_data = NULL;
+        target_params.cb_eval_user_data = &g_target_collector;
     }
 
     llama_init_result llama_init;
@@ -1045,6 +1155,9 @@ int main(int argc, char ** argv) {
 
     if (has_draft_model) {
         gpt_params draft_params = build_draft_imatrix_params(params);
+        g_draft_collector.set_params(draft_params);
+        g_draft_collector.set_collect_lsim(lsim);
+        draft_params.cb_eval_user_data = &g_draft_collector;
         auto mparams_dft = common_model_params_to_llama(draft_params);
 
         model_dft = ik_load_model_from_params(draft_params, mparams_dft);
@@ -1062,8 +1175,11 @@ int main(int argc, char ** argv) {
         }
 
         target_params.has_mtp = true;
-        target_params.cb_eval = nullptr;
-        target_params.cb_eval_user_data = nullptr;
+        target_params.cb_eval = ik_collect_imatrix;
+        target_params.cb_eval_user_data = &g_target_collector;
+
+        fprintf(stderr, "%s : paired imatrix outputs: target='%s', draft='%s'\n",
+            __func__, target_params.out_file.c_str(), draft_params.out_file.c_str());
 
         auto mparams_tgt = common_model_params_to_llama(target_params);
         llama_model * model_tgt = ik_load_model_from_params(target_params, mparams_tgt);
@@ -1141,8 +1257,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    g_collector.save_imatrix();
-    g_collector.print_layer_importance();
+    g_target_collector.save_imatrix();
+    g_target_collector.print_layer_importance();
+
+    if (ctx_dft != nullptr) {
+        g_draft_collector.save_imatrix();
+        g_draft_collector.print_layer_importance();
+    }
 
     llama_print_timings(ctx);
 
