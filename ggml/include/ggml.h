@@ -240,7 +240,7 @@
 // if you need to load more than 64 model shards.
 #define GGML_MAX_CONTEXTS 2048 // Was 64, but I prefer to force it to 2048 on my fork just in case users forget to set -DGGML_MAX_CONTEXTS=2048 at compilation
 #endif
-#define GGML_MAX_SRC            10
+#define GGML_MAX_SRC            12
 #ifndef GGML_MAX_NAME
 #define GGML_MAX_NAME           64
 #endif
